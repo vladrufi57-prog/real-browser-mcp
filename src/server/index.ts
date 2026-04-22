@@ -7,6 +7,25 @@ import { ensureArtifactsDir, errorResult, jsonText, nextScreenshotPath, textResu
 import { TaskSessionRegistry } from "./task-sessions.js";
 import type { BrowserTab, PageSnapshot } from "./types.js";
 
+type PageStateResult = {
+  url: string;
+  title: string;
+  readyState: string;
+  documentToken: string;
+};
+
+type ElementStateResult = {
+  exists: boolean;
+  elementId: string;
+  tagName?: string;
+  role?: string;
+  visible?: boolean;
+  disabled?: boolean;
+  editable?: boolean;
+  text?: string;
+  value?: string;
+};
+
 const RELAY_PORT = Number(process.env.REAL_BROWSER_MCP_PORT ?? 17373);
 const relay = new LocalBrowserRelay(RELAY_PORT);
 const sessions = new TaskSessionRegistry(() => relay.listTabs());
@@ -95,6 +114,297 @@ async function resolveElementTarget(input: {
     tab,
     target,
   };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function getPageState(tabId: number): Promise<PageStateResult> {
+  return (await relay.call("getPageState", {
+    tabId,
+  })) as PageStateResult;
+}
+
+async function getElementState(tabId: number, elementId: string): Promise<ElementStateResult> {
+  return (await relay.call("getElementState", {
+    tabId,
+    elementId,
+  })) as ElementStateResult;
+}
+
+async function waitForNetworkIdle(input: {
+  tabId: number;
+  idleMs?: number;
+  timeoutMs?: number;
+  maxInflightRequests?: number;
+}): Promise<{
+  idle: boolean;
+  timedOut: boolean;
+  inflightRequests: number;
+  idleForMs: number;
+  elapsedMs: number;
+  lastNetworkActivityAt?: string;
+}> {
+  return (await relay.call("waitForNetworkIdle", {
+    tabId: input.tabId,
+    idleMs: input.idleMs ?? 1000,
+    timeoutMs: input.timeoutMs ?? 15000,
+    maxInflightRequests: input.maxInflightRequests ?? 0,
+  }, (input.timeoutMs ?? 15000) + 1000)) as {
+    idle: boolean;
+    timedOut: boolean;
+    inflightRequests: number;
+    idleForMs: number;
+    elapsedMs: number;
+    lastNetworkActivityAt?: string;
+  };
+}
+
+async function waitForNavigationState(input: {
+  tabId: number;
+  startUrl?: string;
+  startDocumentToken?: string;
+  waitUntil?: "interactive" | "complete";
+  requireUrlChange?: boolean;
+  targetUrlIncludes?: string;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  requireNetworkIdle?: boolean;
+  networkIdleMs?: number;
+  maxInflightRequests?: number;
+}): Promise<{
+  ok: boolean;
+  timedOut: boolean;
+  elapsedMs: number;
+  startUrl?: string;
+  error?: string;
+  page: PageStateResult;
+  network?: {
+    idle: boolean;
+    timedOut: boolean;
+    inflightRequests: number;
+    idleForMs: number;
+    elapsedMs: number;
+    lastNetworkActivityAt?: string;
+  };
+}> {
+  const startedAt = Date.now();
+  const timeoutMs = input.timeoutMs ?? 15000;
+  const pollIntervalMs = input.pollIntervalMs ?? 250;
+  const waitUntil = input.waitUntil ?? "complete";
+  let initialPageState: PageStateResult | undefined;
+  try {
+    initialPageState = await getPageState(input.tabId);
+  } catch (_error) {
+    initialPageState = undefined;
+  }
+
+  const fallbackTab = pickTab(input.tabId);
+  const startUrl = input.startUrl ?? initialPageState?.url ?? fallbackTab.url;
+  const startDocumentToken = input.startDocumentToken ?? initialPageState?.documentToken;
+  let lastPageState: PageStateResult = initialPageState ?? {
+    url: startUrl,
+    title: fallbackTab.title,
+    readyState: "loading",
+    documentToken: startDocumentToken ?? "",
+  };
+  let lastError: string | undefined;
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    try {
+      lastPageState = await getPageState(input.tabId);
+      lastError = undefined;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await sleep(pollIntervalMs);
+      continue;
+    }
+    const urlChanged = lastPageState.url !== startUrl;
+    const documentChanged =
+      Boolean(startDocumentToken) &&
+      lastPageState.documentToken !== startDocumentToken;
+    const navigationCondition = input.requireUrlChange
+      ? urlChanged
+      : urlChanged || documentChanged;
+    const readyCondition =
+      waitUntil === "interactive"
+        ? ["interactive", "complete"].includes(lastPageState.readyState)
+        : lastPageState.readyState === "complete";
+    const targetUrlCondition =
+      !input.targetUrlIncludes ||
+      lastPageState.url.includes(input.targetUrlIncludes);
+
+    if (navigationCondition && readyCondition && targetUrlCondition) {
+      let network:
+        | {
+            idle: boolean;
+            timedOut: boolean;
+            inflightRequests: number;
+            idleForMs: number;
+            elapsedMs: number;
+            lastNetworkActivityAt?: string;
+          }
+        | undefined;
+
+      if (input.requireNetworkIdle) {
+        const remainingTimeoutMs = Math.max(250, timeoutMs - (Date.now() - startedAt));
+        network = await waitForNetworkIdle({
+          tabId: input.tabId,
+          idleMs: input.networkIdleMs ?? 1000,
+          timeoutMs: remainingTimeoutMs,
+          maxInflightRequests: input.maxInflightRequests ?? 0,
+        });
+        if (!network.idle) {
+          return {
+            ok: false,
+            timedOut: true,
+            elapsedMs: Date.now() - startedAt,
+            startUrl,
+            page: lastPageState,
+            network,
+          };
+        }
+      }
+
+      return {
+        ok: true,
+        timedOut: false,
+        elapsedMs: Date.now() - startedAt,
+        startUrl,
+        page: lastPageState,
+        network,
+      };
+    }
+
+    await sleep(pollIntervalMs);
+  }
+
+  return {
+    ok: false,
+    timedOut: true,
+    elapsedMs: Date.now() - startedAt,
+    startUrl,
+    page: lastPageState,
+    error: lastError,
+  };
+}
+
+const elementWaitStates = [
+  "exists",
+  "visible",
+  "hidden",
+  "enabled",
+  "disabled",
+  "text_contains",
+  "value_contains",
+] as const;
+
+async function waitForElementState(input: {
+  tabId: number;
+  elementId: string;
+  state: (typeof elementWaitStates)[number];
+  expectedText?: string;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+}): Promise<{
+  ok: boolean;
+  timedOut: boolean;
+  elapsedMs: number;
+  error?: string;
+  observed: ElementStateResult;
+}> {
+  const startedAt = Date.now();
+  const timeoutMs = input.timeoutMs ?? 10000;
+  const pollIntervalMs = input.pollIntervalMs ?? 250;
+  let observed: ElementStateResult = {
+    exists: false,
+    elementId: input.elementId,
+  };
+  let lastError: string | undefined;
+
+  const matches = (value: typeof observed): boolean => {
+    switch (input.state) {
+      case "exists":
+        return value.exists;
+      case "visible":
+        return Boolean(value.exists && value.visible);
+      case "hidden":
+        return !value.exists || !value.visible;
+      case "enabled":
+        return Boolean(value.exists && !value.disabled);
+      case "disabled":
+        return Boolean(value.exists && value.disabled);
+      case "text_contains":
+        return Boolean(value.exists && input.expectedText && value.text?.includes(input.expectedText));
+      case "value_contains":
+        return Boolean(value.exists && input.expectedText && value.value?.includes(input.expectedText));
+      default:
+        return false;
+    }
+  };
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    try {
+      observed = await getElementState(input.tabId, input.elementId);
+      lastError = undefined;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+      await sleep(pollIntervalMs);
+      continue;
+    }
+    if (matches(observed)) {
+      return {
+        ok: true,
+        timedOut: false,
+        elapsedMs: Date.now() - startedAt,
+        observed,
+      };
+    }
+    await sleep(pollIntervalMs);
+  }
+
+  return {
+    ok: false,
+    timedOut: true,
+    elapsedMs: Date.now() - startedAt,
+    error: lastError,
+    observed,
+  };
+}
+
+async function runPostActionWaits(input: {
+  tabId: number;
+  startPageState: PageStateResult;
+  waitForNavigation?: boolean;
+  waitForNetworkIdle?: boolean;
+  waitTimeoutMs?: number;
+  networkIdleMs?: number;
+}): Promise<Record<string, unknown> | undefined> {
+  const waits: Record<string, unknown> = {};
+
+  if (input.waitForNavigation) {
+    waits.navigation = await waitForNavigationState({
+      tabId: input.tabId,
+      startUrl: input.startPageState.url,
+      startDocumentToken: input.startPageState.documentToken,
+      timeoutMs: input.waitTimeoutMs ?? 15000,
+      requireUrlChange: false,
+      waitUntil: "complete",
+      requireNetworkIdle: input.waitForNetworkIdle,
+      networkIdleMs: input.networkIdleMs ?? 1000,
+    });
+  } else if (input.waitForNetworkIdle) {
+    waits.network = await waitForNetworkIdle({
+      tabId: input.tabId,
+      timeoutMs: input.waitTimeoutMs ?? 15000,
+      idleMs: input.networkIdleMs ?? 1000,
+    });
+  }
+
+  return Object.keys(waits).length > 0 ? waits : undefined;
 }
 
 server.registerTool(
@@ -294,6 +604,126 @@ server.registerTool(
 );
 
 server.registerTool(
+  "wait_for_navigation",
+  {
+    description:
+      "Wait for a tab to finish a navigation-like transition by polling URL and document readiness, with optional network-idle confirmation.",
+    inputSchema: {
+      tabId: z.number().int().optional(),
+      sessionId: z.string().uuid().optional(),
+      startUrl: z.string().optional(),
+      waitUntil: z.enum(["interactive", "complete"]).optional(),
+      requireUrlChange: z.boolean().optional(),
+      targetUrlIncludes: z.string().min(1).optional(),
+      timeoutMs: z.number().int().min(250).max(60000).optional(),
+      pollIntervalMs: z.number().int().min(50).max(5000).optional(),
+      requireNetworkIdle: z.boolean().optional(),
+      networkIdleMs: z.number().int().min(100).max(10000).optional(),
+      maxInflightRequests: z.number().int().min(0).max(20).optional(),
+    },
+  },
+  async ({
+    tabId,
+    sessionId,
+    startUrl,
+    waitUntil,
+    requireUrlChange,
+    targetUrlIncludes,
+    timeoutMs,
+    pollIntervalMs,
+    requireNetworkIdle,
+    networkIdleMs,
+    maxInflightRequests,
+  }) => {
+    const tab = pickTargetTab({ tabId, sessionId });
+    const result = await waitForNavigationState({
+      tabId: tab.tabId,
+      startUrl,
+      waitUntil,
+      requireUrlChange,
+      targetUrlIncludes,
+      timeoutMs,
+      pollIntervalMs,
+      requireNetworkIdle,
+      networkIdleMs,
+      maxInflightRequests,
+    });
+    return textResult(jsonText(result));
+  },
+);
+
+server.registerTool(
+  "wait_for_element_state",
+  {
+    description:
+      "Wait until a previously captured element reaches a target state such as visible, hidden, enabled, disabled, or text/value contains.",
+    inputSchema: {
+      elementId: z.string().min(1),
+      state: z.enum(elementWaitStates),
+      expectedText: z.string().optional(),
+      tabId: z.number().int().optional(),
+      sessionId: z.string().uuid().optional(),
+      timeoutMs: z.number().int().min(250).max(60000).optional(),
+      pollIntervalMs: z.number().int().min(50).max(5000).optional(),
+    },
+  },
+  async ({
+    elementId,
+    state,
+    expectedText,
+    tabId,
+    sessionId,
+    timeoutMs,
+    pollIntervalMs,
+  }) => {
+    if (
+      (state === "text_contains" || state === "value_contains") &&
+      !expectedText
+    ) {
+      throw new Error(
+        `State '${state}' requires 'expectedText' to be provided.`,
+      );
+    }
+
+    const tab = pickTargetTab({ tabId, sessionId });
+    const result = await waitForElementState({
+      tabId: tab.tabId,
+      elementId,
+      state,
+      expectedText,
+      timeoutMs,
+      pollIntervalMs,
+    });
+    return textResult(jsonText(result));
+  },
+);
+
+server.registerTool(
+  "wait_for_network_idle",
+  {
+    description:
+      "Wait until CDP network activity settles for a tab and the number of inflight requests drops below the desired threshold.",
+    inputSchema: {
+      tabId: z.number().int().optional(),
+      sessionId: z.string().uuid().optional(),
+      idleMs: z.number().int().min(100).max(10000).optional(),
+      timeoutMs: z.number().int().min(250).max(60000).optional(),
+      maxInflightRequests: z.number().int().min(0).max(20).optional(),
+    },
+  },
+  async ({ tabId, sessionId, idleMs, timeoutMs, maxInflightRequests }) => {
+    const tab = pickTargetTab({ tabId, sessionId });
+    const result = await waitForNetworkIdle({
+      tabId: tab.tabId,
+      idleMs,
+      timeoutMs,
+      maxInflightRequests,
+    });
+    return textResult(jsonText(result));
+  },
+);
+
+server.registerTool(
   "hover_element",
   {
     description: "Move the mouse over an element from a previously captured page snapshot.",
@@ -332,14 +762,27 @@ server.registerTool(
       elementId: z.string().min(1),
       tabId: z.number().int().optional(),
       sessionId: z.string().uuid().optional(),
+      waitForNavigation: z.boolean().optional(),
+      waitForNetworkIdle: z.boolean().optional(),
+      waitTimeoutMs: z.number().int().min(250).max(60000).optional(),
+      networkIdleMs: z.number().int().min(100).max(10000).optional(),
     },
   },
-  async ({ elementId, tabId, sessionId }) => {
+  async ({
+    elementId,
+    tabId,
+    sessionId,
+    waitForNavigation,
+    waitForNetworkIdle,
+    waitTimeoutMs,
+    networkIdleMs,
+  }) => {
     const { tab, target } = await resolveElementTarget({
       elementId,
       tabId,
       sessionId,
     });
+    const startPageState = await getPageState(tab.tabId);
     const result = (await relay.call("cdpClick", {
       tabId: tab.tabId,
       x: target.center.x,
@@ -352,11 +795,20 @@ server.registerTool(
       clickCount: number;
       strategy: string;
     };
+    const waits = await runPostActionWaits({
+      tabId: tab.tabId,
+      startPageState,
+      waitForNavigation,
+      waitForNetworkIdle,
+      waitTimeoutMs,
+      networkIdleMs,
+    });
     return textResult(
       jsonText({
         ...result,
         elementId: target.elementId,
         target,
+        waits,
       }),
     );
   },
@@ -373,14 +825,29 @@ server.registerTool(
       clearFirst: z.boolean().optional(),
       tabId: z.number().int().optional(),
       sessionId: z.string().uuid().optional(),
+      waitForNavigation: z.boolean().optional(),
+      waitForNetworkIdle: z.boolean().optional(),
+      waitTimeoutMs: z.number().int().min(250).max(60000).optional(),
+      networkIdleMs: z.number().int().min(100).max(10000).optional(),
     },
   },
-  async ({ elementId, text, clearFirst, tabId, sessionId }) => {
+  async ({
+    elementId,
+    text,
+    clearFirst,
+    tabId,
+    sessionId,
+    waitForNavigation,
+    waitForNetworkIdle,
+    waitTimeoutMs,
+    networkIdleMs,
+  }) => {
     const { tab, target } = await resolveElementTarget({
       elementId,
       tabId,
       sessionId,
     });
+    const startPageState = await getPageState(tab.tabId);
 
     await relay.call("cdpClick", {
       tabId: tab.tabId,
@@ -389,24 +856,37 @@ server.registerTool(
       clickCount: 1,
     });
 
-    const result = (await relay.call("typeIntoElement", {
+    const prepared = (await relay.call("prepareElementForTyping", {
       tabId: tab.tabId,
-      elementId,
-      text: "",
+      elementId: target.elementId,
       clearFirst: clearFirst ?? true,
-    })) as { typed: boolean; elementId: string; value: string };
+    })) as { prepared: boolean; elementId: string; cleared: boolean; value: string };
 
     const typed = (await relay.call("cdpTypeText", {
       tabId: tab.tabId,
       text,
     })) as { typed: boolean; textLength: number; strategy: string };
+    const observed = await getElementState(tab.tabId, target.elementId);
+    const waits = await runPostActionWaits({
+      tabId: tab.tabId,
+      startPageState,
+      waitForNavigation,
+      waitForNetworkIdle,
+      waitTimeoutMs,
+      networkIdleMs,
+    });
 
     return textResult(
       jsonText({
-        ...result,
-        cdp: typed,
+        typed: typed.typed,
         elementId: target.elementId,
+        value: observed.value,
+        text: observed.text,
+        state: observed,
+        preparation: prepared,
+        cdp: typed,
         target,
+        waits,
       }),
     );
   },

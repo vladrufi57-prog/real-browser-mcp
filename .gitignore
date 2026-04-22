@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .artifacts/
+.tmp/
 
 *.log
 .DS_Store

@@ -4,6 +4,7 @@
   "description": "Auto-connects your real Chromium browser to a local MCP relay without per-tab manual connect.",
   "version": "0.1.0",
   "permissions": [
+    "alarms",
     "debugger",
     "tabs",
     "storage",

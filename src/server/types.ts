@@ -31,6 +31,8 @@ export type ElementBox = {
 
 export type PageElementSnapshot = {
   id: string;
+  contextId: string;
+  contextType: "top-document" | "iframe-document" | "shadow-root";
   role: string;
   tagName: string;
   text: string;
@@ -47,6 +49,10 @@ export type PageElementSnapshot = {
   editable: boolean;
   checked?: boolean;
   selected?: boolean;
+  backendNodeId?: number;
+  axRole?: string;
+  axName?: string;
+  axDescription?: string;
   bbox: ElementBox;
 };
 
@@ -73,6 +79,7 @@ export type PageFormFieldSnapshot = {
 
 export type PageFormSnapshot = {
   elementId: string;
+  contextId: string;
   name: string;
   method: string;
   action?: string;
@@ -87,6 +94,7 @@ export type PageFormSnapshot = {
 
 export type PageImageSnapshot = {
   elementId: string;
+  contextId: string;
   kind: "img" | "video" | "canvas";
   alt: string;
   title?: string;
@@ -98,9 +106,106 @@ export type PageImageSnapshot = {
 
 export type PageLandmarkSnapshot = {
   elementId: string;
+  contextId: string;
   role: string;
   label: string;
   textExcerpt: string;
+};
+
+export type PageContextSnapshot = {
+  contextId: string;
+  parentContextId?: string;
+  kind: "top-document" | "iframe-document" | "shadow-root";
+  frameElementId?: string;
+  hostElementId?: string;
+  url: string;
+  title?: string;
+  name?: string;
+  sameOrigin: boolean;
+  root: boolean;
+};
+
+export type PageOverlaySnapshot = {
+  elementId: string;
+  contextId: string;
+  kind: "dialog" | "menu" | "listbox" | "tooltip" | "popover";
+  label: string;
+  textExcerpt: string;
+  modal: boolean;
+  bbox: ElementBox;
+};
+
+export type PageEditorSnapshot = {
+  elementId: string;
+  contextId: string;
+  kind: "textbox" | "contenteditable" | "searchbox";
+  label: string;
+  value?: string;
+  multiline: boolean;
+  focused: boolean;
+  bbox: ElementBox;
+};
+
+export type PageTableSnapshot = {
+  elementId: string;
+  contextId: string;
+  role: string;
+  label: string;
+  caption?: string;
+  columnHeaders: string[];
+  rowCount: number;
+  visibleRowCount: number;
+  bbox: ElementBox;
+};
+
+export type PageTrackedElementAccessibility = {
+  elementId: string;
+  backendDOMNodeId?: number;
+  role?: string;
+  name?: string;
+  description?: string;
+  value?: string;
+  ignored: boolean;
+};
+
+export type PageInterestingAxNode = {
+  nodeId: string;
+  backendDOMNodeId?: number;
+  role: string;
+  name: string;
+  description?: string;
+  value?: string;
+  ignored: boolean;
+  childIds: string[];
+};
+
+export type PageAccessibilitySummary = {
+  available: boolean;
+  nodeCount: number;
+  trackedElements: PageTrackedElementAccessibility[];
+  interestingNodes: PageInterestingAxNode[];
+  error?: string;
+};
+
+export type PageTrackedElementLayout = {
+  elementId: string;
+  backendDOMNodeId: number;
+  nodeName: string;
+  frameId?: string;
+  contextId?: string;
+  isClickable: boolean;
+  shadowRootType?: string;
+  bounds?: ElementBox;
+};
+
+export type PageLayoutSummary = {
+  available: boolean;
+  documentCount: number;
+  layoutNodeCount: number;
+  textBoxCount: number;
+  frameIds: string[];
+  trackedElements: PageTrackedElementLayout[];
+  error?: string;
 };
 
 export type PageActionCandidate = {
@@ -118,6 +223,15 @@ export type PageStateSummary = {
   hasLoginForm: boolean;
   hasSearch: boolean;
   hasCookieBanner: boolean;
+  hasMenu: boolean;
+  hasPopover: boolean;
+  hasTable: boolean;
+  hasRichEditor: boolean;
+  hasVirtualizedList: boolean;
+  hasIframes: boolean;
+  hasShadowDom: boolean;
+  axTreeAvailable: boolean;
+  domSnapshotAvailable: boolean;
   activeElementId?: string;
   activeElementRole?: string;
   activeElementLabel?: string;
@@ -139,10 +253,16 @@ export type PageSnapshot = {
   };
   state: PageStateSummary;
   documentTextExcerpt: string;
+  contexts: PageContextSnapshot[];
   headings: PageHeadingSnapshot[];
   forms: PageFormSnapshot[];
   images: PageImageSnapshot[];
   landmarks: PageLandmarkSnapshot[];
+  overlays: PageOverlaySnapshot[];
+  editors: PageEditorSnapshot[];
+  tables: PageTableSnapshot[];
+  accessibility: PageAccessibilitySummary;
+  layout: PageLayoutSummary;
   primaryActions: PageActionCandidate[];
   elements: PageElementSnapshot[];
 };
@@ -164,6 +284,9 @@ export type DebuggerAttachment = {
   tabId: number;
   attachedAt: string;
   lastUsedAt: string;
+  networkTracking?: boolean;
+  inflightRequests?: number;
+  lastNetworkActivityAt?: string;
 };
 
 export type DebuggerStatus = {
@@ -207,6 +330,9 @@ export type RelayMethod =
   | "duplicateTab"
   | "closeTab"
   | "getDebuggerState"
+  | "getPageState"
+  | "getElementState"
+  | "waitForNetworkIdle"
   | "navigateTab"
   | "snapshotTab"
   | "getElementTarget"
@@ -216,6 +342,7 @@ export type RelayMethod =
   | "cdpScroll"
   | "cdpPressKey"
   | "clickElement"
+  | "prepareElementForTyping"
   | "typeIntoElement"
   | "selectOption"
   | "pressKey"

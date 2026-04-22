@@ -34,6 +34,10 @@
 - `open_tab`
 - `navigate_tab`
 - `snapshot_tab`
+- `wait_for_navigation`
+- `wait_for_element_state`
+- `wait_for_network_idle`
+- `hover_element`
 - `click_element`
 - `type_into_element`
 - `select_option`
@@ -47,9 +51,15 @@
 This stack is intentionally hybrid:
 
 - Strong at structure:
-  - URLs, titles, ready state, active field, visible text, headings, forms, buttons, links, labels, landmarks, images, and bounding boxes
+  - URLs, titles, ready state, active field, visible text, headings, forms, buttons, links, labels, landmarks, images, overlays, editors, tables, and bounding boxes
   - primary action candidates so the agent can quickly understand what matters on the current screen
   - interacting with elements by stable element ids from a page snapshot
+  - same-origin iframe and open shadow DOM coverage through explicit page contexts
+- Stronger semantic perception:
+  - CDP accessibility summaries from `Accessibility.getFullAXTree`
+  - DOM/layout summaries from `DOMSnapshot.captureSnapshot`
+  - merged DOM + AX + layout hints on tracked elements when the page allows CDP inspection
+  - richer UI-state flags for dialogs, menus, popovers, tables, rich editors, virtualized lists, iframe presence, and shadow DOM presence
 - Strong at browser actions:
   - opening tabs, focusing tabs, navigating, clicking, typing, selecting options, pressing keys, scrolling, taking screenshots
 - Medium at visual interpretation:
@@ -84,6 +94,15 @@ Important tradeoff:
 
 - the `debugger` permission causes Chrome to show a debugging banner while a tab is attached
 - this is the technical price for stronger background-safe control and future human-like input
+
+## Minimal waits
+
+The MCP now includes a first reliability pass for common UI races:
+
+- `wait_for_navigation` polls URL and document readiness, with optional network-idle confirmation
+- `wait_for_element_state` waits for `exists`, `visible`, `hidden`, `enabled`, `disabled`, `text_contains`, or `value_contains`
+- `wait_for_network_idle` uses CDP network tracking and reports whether the idle condition was reached or timed out
+- `click_element` and `type_into_element` can optionally run post-action waits instead of returning immediately after input
 
 ## Install
 
